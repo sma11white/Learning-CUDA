@@ -11,22 +11,18 @@ __global__ void rmsNormKernel(const T* __restrict__ input,
                               size_t rows,
                               size_t hidden_dim,
                               float eps) {
-    // 动态共享内存，用于存储 warp 级别的局部和
     extern __shared__ float s_sum[];
-    // 每个 block 负责一行，ty 表示行索引
     size_t row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= rows) return;
     size_t tid = threadIdx.x;
     size_t row_offset = row * hidden_dim;
 
-    // Step 1: 每个线程计算自己负责元素的局部平方和
-    T local_sum = 0.0;
+    float local_sum = 0.0f;
     for (size_t col = tid; col < hidden_dim; col += blockDim.x) {
-        T val = static_cast<T>(input[row_offset + col]);
+        float val = static_cast<float>(input[row_offset + col]);
         local_sum += val * val;
     }
 
-    // Step 2: Block 内归约求和（使用共享内存）
     s_sum[tid] = local_sum;
     __syncthreads();
     for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -36,11 +32,9 @@ __global__ void rmsNormKernel(const T* __restrict__ input,
         __syncthreads();
     }
 
-    // Step 3: 计算 RMS 缩放因子
     float mean_sq = s_sum[0] / static_cast<float>(hidden_dim);
     float rms = rsqrtf(mean_sq + eps);
 
-    // Step 4: 每个线程重新遍历，计算并写回输出
     for (size_t col = tid; col < hidden_dim; col += blockDim.x) {
         float val = static_cast<float>(input[row_offset + col]);
         float w = static_cast<float>(weight[col]);
@@ -71,21 +65,18 @@ template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
-    // TODO: Implement the rmsNorm function
-    // 1. 声明变量与内存大小计算
     T *d_input = nullptr, *d_weight = nullptr, *d_output = nullptr;
     size_t input_bytes  = rows * hidden_dim * sizeof(T);
     size_t weight_bytes = hidden_dim * sizeof(T);
-    // 2.内存的申请与分配(主机->设备)
+    
     cudaMalloc(&d_input, input_bytes);
     cudaMalloc(&d_weight, weight_bytes);
     cudaMalloc(&d_output, input_bytes);
     cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_weight, h_weight.data(), weight_bytes, cudaMemcpyHostToDevice);
-    // 3. 调用内核函数
-    dim3 blockDim(256,1);
-    dim3 gridDim(1,rows);
-
+    
+    dim3 blockDim(256, 1);
+    dim3 gridDim(1, rows);
     size_t shared_mem_size = blockDim.x * sizeof(float);
 
     rmsNormKernel<<<gridDim, blockDim, shared_mem_size>>>(
@@ -96,10 +87,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
         fprintf(stderr, "CUDA kernel failed: %s\n", cudaGetErrorString(err));
     }
 
-    // 4. 拷贝结果(设备->主机)
     cudaMemcpy(h_output.data(), d_output, input_bytes, cudaMemcpyDeviceToHost);
-
-    // 5. 释放设备内存
     cudaFree(d_input);
     cudaFree(d_weight);
     cudaFree(d_output);
@@ -127,27 +115,17 @@ __global__ void flash_attention_kernel_original_softmax(
     const int query_tile_idx  = blockIdx.z;
     const int global_query_row_idx = query_tile_idx * BLOCK_SIZE_Q + thread_idx;
 
-    // -------------------------------------------------------------------------
-    // Shared Memory
-    // -------------------------------------------------------------------------
     extern __shared__ char shared_mem_buffer[];
     float* shared_mem_ptr = reinterpret_cast<float*>(shared_mem_buffer);
-    float* s_query  = shared_mem_ptr;                                  // [BLOCK_SIZE_Q][head_dim]
-    float* s_key    = shared_mem_ptr + BLOCK_SIZE_Q * head_dim;        // [BLOCK_SIZE_KV][head_dim]
-    float* s_value  = shared_mem_ptr + (BLOCK_SIZE_Q + BLOCK_SIZE_KV) * head_dim;    // [BLOCK_SIZE_KV][head_dim]
+    float* s_query  = shared_mem_ptr;
+    float* s_key    = shared_mem_ptr + BLOCK_SIZE_Q * head_dim;
+    float* s_value  = shared_mem_ptr + (BLOCK_SIZE_Q + BLOCK_SIZE_KV) * head_dim;
 
-    // -------------------------------------------------------------------------
-    // 累加器初始化
-    // -------------------------------------------------------------------------
     float accumulated_output[128];
-    #pragma unroll
     for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
         accumulated_output[dim_idx] = 0.0f;
     }
 
-    // -------------------------------------------------------------------------
-    // Step 1: 加载 Q tile
-    // -------------------------------------------------------------------------
     if (global_query_row_idx < target_seq_len) {
         const T* query_ptr = Q + ((batch_idx * target_seq_len + global_query_row_idx) * query_heads + query_head_idx) * head_dim;
         for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
@@ -156,16 +134,12 @@ __global__ void flash_attention_kernel_original_softmax(
     }
 
     const int num_kv_blocks = (source_seq_len + BLOCK_SIZE_KV - 1) / BLOCK_SIZE_KV;
-    float current_max_val = -FLT_MAX; // 初始化全局最大值
+    float current_max_val = -FLT_MAX;
 
-    // -------------------------------------------------------------------------
-    // Pass 1: 遍历 K/V 寻找最大值 current_max_val
-    // -------------------------------------------------------------------------
     for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
         const int kv_block_offset = kv_block_idx * BLOCK_SIZE_KV;
         __syncthreads();
 
-        // 加载 s_key (不需要 s_value)
         const int elements_per_block = BLOCK_SIZE_KV * head_dim;
         for (int element_idx = thread_idx; element_idx < elements_per_block; element_idx += BLOCK_SIZE_Q) {
             int row_local = element_idx / head_dim;
@@ -180,36 +154,31 @@ __global__ void flash_attention_kernel_original_softmax(
         }
         __syncthreads();
 
-        if (global_query_row_idx >= target_seq_len) continue;
+        if (global_query_row_idx < target_seq_len) {
+            for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
+                int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
+                if (global_kv_row_idx >= source_seq_len) break;
+                if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
 
-        for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
-            int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
-            if (global_kv_row_idx >= source_seq_len) break;
-            if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
+                float attention_score = 0.0f;
+                for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
+                }
+                attention_score *= softmax_scale;
 
-            float attention_score = 0.0f;
-            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
-            }
-            attention_score *= softmax_scale;
-
-            // 更新全局最大值
-            if (attention_score > current_max_val) {
-                current_max_val = attention_score;
+                if (attention_score > current_max_val) {
+                    current_max_val = attention_score;
+                }
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Pass 2: 遍历 K/V 计算 Softmax 权重并累加 O
-    // -------------------------------------------------------------------------
-    float denominator_sum = 0.0f; // 归一化分母
+    float denominator_sum = 0.0f;
 
     for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
         const int kv_block_offset = kv_block_idx * BLOCK_SIZE_KV;
         __syncthreads();
 
-        // 加载 s_key 和 s_value
         const int elements_per_block = BLOCK_SIZE_KV * head_dim;
         for (int element_idx = thread_idx; element_idx < elements_per_block; element_idx += BLOCK_SIZE_Q) {
             int row_local = element_idx / head_dim;
@@ -228,42 +197,33 @@ __global__ void flash_attention_kernel_original_softmax(
         }
         __syncthreads();
 
-        if (global_query_row_idx >= target_seq_len) continue;
+        if (global_query_row_idx < target_seq_len) {
+            for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
+                int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
+                if (global_kv_row_idx >= source_seq_len) break;
+                if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
 
-        for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
-            int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
-            if (global_kv_row_idx >= source_seq_len) break;
-            if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
+                float attention_score = 0.0f;
+                for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
+                }
+                attention_score *= softmax_scale;
 
-            // 重新计算 attention_score (或者如果显存够大，可以在 Pass 1 存下来)
-            float attention_score = 0.0f;
-            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
-            }
-            attention_score *= softmax_scale;
+                float prob_weight = expf(attention_score - current_max_val);
+                denominator_sum += prob_weight;
 
-            // 原始 Safe Softmax: P = exp(s - m)
-            float prob_weight = expf(attention_score - current_max_val);
-
-            // 累加分母
-            denominator_sum += prob_weight;
-
-            // 累加输出: accumulated_output += P * V
-            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                accumulated_output[dim_idx] += prob_weight * s_value[kv_idx_in_block * head_dim + dim_idx];
+                for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    accumulated_output[dim_idx] += prob_weight * s_value[kv_idx_in_block * head_dim + dim_idx];
+                }
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Step 4: 归一化并写回
-    // -------------------------------------------------------------------------
+    // 归一化并写回
     if (global_query_row_idx < target_seq_len) {
         float norm_factor = (denominator_sum == 0.0f) ? 0.0f : (1.0f / denominator_sum);
-        
         T* output_ptr = O + ((batch_idx * target_seq_len + global_query_row_idx) * query_heads + query_head_idx) * head_dim;
         
-        #pragma unroll 4
         for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
             output_ptr[dim_idx] = static_cast<T>(accumulated_output[dim_idx] * norm_factor);
         }
@@ -291,7 +251,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal){          
-    // 1. 基础校验
     size_t num_query_elements = (size_t)batch_size * target_seq_len * query_heads * head_dim;
     size_t num_kv_elements = (size_t)batch_size * src_seq_len * kv_heads * head_dim;
     if (h_q.size() != num_query_elements || h_k.size() != num_kv_elements || h_v.size() != num_kv_elements) {
@@ -311,7 +270,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     h_o.resize(num_query_elements);
 
-    // 2. 设备内存分配
     T *device_q, *device_k, *device_v, *device_o;
     size_t query_bytes  = num_query_elements * sizeof(T);
     size_t kv_bytes = num_kv_elements * sizeof(T);
@@ -330,8 +288,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     cudaStream_t stream = 0;
     cudaError_t cuda_error;
 
-    // 3. Launch 配置
-    // Lambda 用于处理不同 BLOCK_SIZE_Q/BLOCK_SIZE_KV 的启动
     auto launch_kernel = [&](auto kernel, int block_size_q, int block_size_kv) {
         int num_query_blocks = (target_seq_len + block_size_q - 1) / block_size_q;
         if (num_query_blocks == 0) num_query_blocks = 1;
@@ -345,11 +301,12 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
         size_t dynamic_shared_mem_size = (block_size_q + block_size_kv + block_size_kv) * head_dim * sizeof(float);
         
-        // 设置 Shared Memory 限制
+        const void* kernel_ptr = reinterpret_cast<const void*>(kernel);
+        
         cudaError_t attribute_error = cudaFuncSetAttribute(
-            kernel, 
+            kernel_ptr, 
             cudaFuncAttributeMaxDynamicSharedMemorySize, 
-            (int)dynamic_shared_mem_size
+            static_cast<int>(dynamic_shared_mem_size)
         );
         
         kernel<<<grid, block, dynamic_shared_mem_size, stream>>>(
@@ -360,8 +317,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         );
     };
 
-    // 根据维度选择 Tile 大小
-    // 使用修改后的 Kernel 函数指针
     if (head_dim <= 64) {
         launch_kernel(flash_attention_kernel_original_softmax<T, 64, 64>, 64, 64);
     } else if (head_dim <= 128) {
@@ -385,8 +340,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 }
 
 // *********************************************************************
-// Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
-// DO NOT MODIFY THIS SECTION
+// Explicit Template Instantiations
 // *********************************************************************
 template void rmsNorm<float>(const std::vector<float>&, const std::vector<float>&,
   std::vector<float>&, size_t, size_t, float);
