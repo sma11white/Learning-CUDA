@@ -105,148 +105,167 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
     cudaFree(d_output);
 }
 
-template <typename T, int Br, int Bc>
-__global__ void flash_attention_kernel(
+template <typename T, int BLOCK_SIZE_Q, int BLOCK_SIZE_KV>
+__global__ void flash_attention_kernel_original_softmax(
     const T* __restrict__ Q,
     const T* __restrict__ K,
     const T* __restrict__ V,
     T* __restrict__ O,
     int batch_size,
-    int tgt_seq_len,
-    int src_seq_len,
+    int target_seq_len,
+    int source_seq_len,
     int query_heads,
     int kv_heads,
     int head_dim,
     bool is_causal,
     float softmax_scale)
 {
-    const int b  = blockIdx.y;          // batch index
-    const int hq = blockIdx.x;          // query head index
-    // GQA: map query head to kv head. Assumes query_heads % kv_heads == 0
-    const int hk = hq * kv_heads / query_heads;
-    const int tid = threadIdx.x;        // 0 .. Br-1
-    const int q_tile_id = blockIdx.z;
-    const int q_row = q_tile_id * Br + tid;
+    const int batch_idx       = blockIdx.y;
+    const int query_head_idx  = blockIdx.x;
+    const int kv_head_idx     = query_head_idx * kv_heads / query_heads;
+    const int thread_idx      = threadIdx.x;
+    const int query_tile_idx  = blockIdx.z;
+    const int global_query_row_idx = query_tile_idx * BLOCK_SIZE_Q + thread_idx;
 
     // -------------------------------------------------------------------------
-    // Shared Memory 布局
+    // Shared Memory
     // -------------------------------------------------------------------------
-    extern __shared__ char smem_raw[];
-    float* smem = reinterpret_cast<float*>(smem_raw);
-    float* Q_tile = smem;                           // [Br][head_dim]
-    float* K_tile = smem + Br * head_dim;           // [Bc][head_dim]
-    float* V_tile = smem + (Br + Bc) * head_dim;    // [Bc][head_dim]
+    extern __shared__ char shared_mem_buffer[];
+    float* shared_mem_ptr = reinterpret_cast<float*>(shared_mem_buffer);
+    float* s_query  = shared_mem_ptr;                                  // [BLOCK_SIZE_Q][head_dim]
+    float* s_key    = shared_mem_ptr + BLOCK_SIZE_Q * head_dim;        // [BLOCK_SIZE_KV][head_dim]
+    float* s_value  = shared_mem_ptr + (BLOCK_SIZE_Q + BLOCK_SIZE_KV) * head_dim;    // [BLOCK_SIZE_KV][head_dim]
 
     // -------------------------------------------------------------------------
-    // 寄存器状态
+    // 累加器初始化
     // -------------------------------------------------------------------------
-    float m_i = -FLT_MAX;   // running max
-    float l_i = 0.0f;       // running sum of exp
-    // 注意：由于head_dim是运行时参数，acc可能被编译器放入local memory。
-    // 如果head_dim固定（如128），建议将head_dim也作为模板参数以使用寄存器。
-    float acc[128];         
-
-    // 初始化累加器
-    // 必须确保 head_dim <= 128，否则这里会越界。Host端需要做检查。
+    float accumulated_output[128];
     #pragma unroll
-    for (int d = 0; d < head_dim; ++d) {
-        acc[d] = 0.0f;
+    for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+        accumulated_output[dim_idx] = 0.0f;
     }
 
     // -------------------------------------------------------------------------
-    // Step 1: 加载 Q tile 到 Shared Memory
+    // Step 1: 加载 Q tile
     // -------------------------------------------------------------------------
-    if (q_row < tgt_seq_len) {
-        const T* q_ptr = Q + ((b * tgt_seq_len + q_row) * query_heads + hq) * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            Q_tile[tid * head_dim + d] = static_cast<float>(q_ptr[d]);
+    if (global_query_row_idx < target_seq_len) {
+        const T* query_ptr = Q + ((batch_idx * target_seq_len + global_query_row_idx) * query_heads + query_head_idx) * head_dim;
+        for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+            s_query[thread_idx * head_dim + dim_idx] = static_cast<float>(query_ptr[dim_idx]);
         }
     }
 
+    const int num_kv_blocks = (source_seq_len + BLOCK_SIZE_KV - 1) / BLOCK_SIZE_KV;
+    float current_max_val = -FLT_MAX; // 初始化全局最大值
+
     // -------------------------------------------------------------------------
-    // Step 2: 遍历 K/V 的列方向 tile
+    // Pass 1: 遍历 K/V 寻找最大值 current_max_val
     // -------------------------------------------------------------------------
-    const int num_kv_tiles = (src_seq_len + Bc - 1) / Bc;
-
-    for (int kv_tile = 0; kv_tile < num_kv_tiles; ++kv_tile) {
-        const int kv_start = kv_tile * Bc;
-
-        // --- 优化：提前判断 Causal Mask ---
-        // 如果整个 K/V tile 都在未来，直接跳过加载和计算，节省带宽
-        if (is_causal && kv_start >= (q_tile_id + 1) * Br) {
-            continue;
-        }
-
+    for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
+        const int kv_block_offset = kv_block_idx * BLOCK_SIZE_KV;
         __syncthreads();
 
-        // 协作加载 K_tile 和 V_tile
-        const int total_kv = Bc * head_dim;
-        for (int idx = tid; idx < total_kv; idx += Br) {
-            int r = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_row = kv_start + r;
-
-            if (kv_row < src_seq_len) {
-                const T* k_ptr = K + ((b * src_seq_len + kv_row) * kv_heads + hk) * head_dim;
-                const T* v_ptr = V + ((b * src_seq_len + kv_row) * kv_heads + hk) * head_dim;
-                K_tile[r * head_dim + d] = static_cast<float>(k_ptr[d]);
-                V_tile[r * head_dim + d] = static_cast<float>(v_ptr[d]);
+        // 加载 s_key (不需要 s_value)
+        const int elements_per_block = BLOCK_SIZE_KV * head_dim;
+        for (int element_idx = thread_idx; element_idx < elements_per_block; element_idx += BLOCK_SIZE_Q) {
+            int row_local = element_idx / head_dim;
+            int dim_local = element_idx % head_dim;
+            int global_kv_row_idx = kv_block_offset + row_local;
+            if (global_kv_row_idx < source_seq_len) {
+                const T* key_ptr = K + ((batch_idx * source_seq_len + global_kv_row_idx) * kv_heads + kv_head_idx) * head_dim;
+                s_key[row_local * head_dim + dim_local] = static_cast<float>(key_ptr[dim_local]);
             } else {
-                K_tile[r * head_dim + d] = 0.0f;
-                V_tile[r * head_dim + d] = 0.0f;
+                s_key[row_local * head_dim + dim_local] = 0.0f;
             }
         }
-
         __syncthreads();
 
-        if (q_row >= tgt_seq_len) continue;
+        if (global_query_row_idx >= target_seq_len) continue;
 
-        // ---------------------------------------------------------------------
-        // Step 3: 计算 dot(Q_i, K_j) 并做 Online Softmax
-        // ---------------------------------------------------------------------
-        for (int j = 0; j < Bc; ++j) {
-            int kv_row = kv_start + j;
-            if (kv_row >= src_seq_len) break;
+        for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
+            int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
+            if (global_kv_row_idx >= source_seq_len) break;
+            if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
 
-            // Causal mask：行级判断
-            if (is_causal && q_row < kv_row) continue;
-
-            float s_ij = 0.0f;
-            // 循环展开有助于向量化
-            #pragma unroll 4
-            for (int d = 0; d < head_dim; ++d) {
-                s_ij += Q_tile[tid * head_dim + d] * K_tile[j * head_dim + d];
+            float attention_score = 0.0f;
+            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
             }
-            s_ij *= softmax_scale;
+            attention_score *= softmax_scale;
 
-            // Online softmax update
-            float m_new = fmaxf(m_i, s_ij);
-            // 修正数值稳定性：exp(x) 当 x过小会归零，过大不重要，无需特殊处理
-            float exp_old = expf(m_i - m_new);
-            float exp_new = expf(s_ij - m_new);
-
-            #pragma unroll 4
-            for (int d = 0; d < head_dim; ++d) {
-                acc[d] = acc[d] * exp_old + exp_new * V_tile[j * head_dim + d];
+            // 更新全局最大值
+            if (attention_score > current_max_val) {
+                current_max_val = attention_score;
             }
-
-            l_i = l_i * exp_old + exp_new;
-            m_i = m_new;
         }
     }
-    
+
     // -------------------------------------------------------------------------
-    // Step 4: 归一化并写回 Global Memory
+    // Pass 2: 遍历 K/V 计算 Softmax 权重并累加 O
     // -------------------------------------------------------------------------
-    if (q_row < tgt_seq_len) {
-        // 修正：防止 l_i 为 0 导致 NaN (例如全mask的情况)
-        float norm = (l_i == 0.0f) ? 0.0f : (1.0f / l_i);
+    float denominator_sum = 0.0f; // 归一化分母
+
+    for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
+        const int kv_block_offset = kv_block_idx * BLOCK_SIZE_KV;
+        __syncthreads();
+
+        // 加载 s_key 和 s_value
+        const int elements_per_block = BLOCK_SIZE_KV * head_dim;
+        for (int element_idx = thread_idx; element_idx < elements_per_block; element_idx += BLOCK_SIZE_Q) {
+            int row_local = element_idx / head_dim;
+            int dim_local = element_idx % head_dim;
+            int global_kv_row_idx = kv_block_offset + row_local;
+
+            if (global_kv_row_idx < source_seq_len) {
+                const T* key_ptr   = K + ((batch_idx * source_seq_len + global_kv_row_idx) * kv_heads + kv_head_idx) * head_dim;
+                const T* value_ptr = V + ((batch_idx * source_seq_len + global_kv_row_idx) * kv_heads + kv_head_idx) * head_dim;
+                s_key[row_local * head_dim + dim_local]   = static_cast<float>(key_ptr[dim_local]);
+                s_value[row_local * head_dim + dim_local] = static_cast<float>(value_ptr[dim_local]);
+            } else {
+                s_key[row_local * head_dim + dim_local]   = 0.0f;
+                s_value[row_local * head_dim + dim_local] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        if (global_query_row_idx >= target_seq_len) continue;
+
+        for (int kv_idx_in_block = 0; kv_idx_in_block < BLOCK_SIZE_KV; ++kv_idx_in_block) {
+            int global_kv_row_idx = kv_block_offset + kv_idx_in_block;
+            if (global_kv_row_idx >= source_seq_len) break;
+            if (is_causal && global_query_row_idx < global_kv_row_idx) continue;
+
+            // 重新计算 attention_score (或者如果显存够大，可以在 Pass 1 存下来)
+            float attention_score = 0.0f;
+            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                attention_score += s_query[thread_idx * head_dim + dim_idx] * s_key[kv_idx_in_block * head_dim + dim_idx];
+            }
+            attention_score *= softmax_scale;
+
+            // 原始 Safe Softmax: P = exp(s - m)
+            float prob_weight = expf(attention_score - current_max_val);
+
+            // 累加分母
+            denominator_sum += prob_weight;
+
+            // 累加输出: accumulated_output += P * V
+            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                accumulated_output[dim_idx] += prob_weight * s_value[kv_idx_in_block * head_dim + dim_idx];
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 4: 归一化并写回
+    // -------------------------------------------------------------------------
+    if (global_query_row_idx < target_seq_len) {
+        float norm_factor = (denominator_sum == 0.0f) ? 0.0f : (1.0f / denominator_sum);
         
-        T* o_ptr = O + ((b * tgt_seq_len + q_row) * query_heads + hq) * head_dim;
+        T* output_ptr = O + ((batch_idx * target_seq_len + global_query_row_idx) * query_heads + query_head_idx) * head_dim;
         
         #pragma unroll 4
-        for (int d = 0; d < head_dim; ++d) {
-            o_ptr[d] = static_cast<T>(acc[d] * norm);
+        for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+            output_ptr[dim_idx] = static_cast<T>(accumulated_output[dim_idx] * norm_factor);
         }
     }
 }
@@ -271,74 +290,70 @@ template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-    // TODO: Implement the flash attention function
+                    int query_heads, int kv_heads, int head_dim, bool is_causal){          
     // 1. 基础校验
-    size_t q_elems = (size_t)batch_size * target_seq_len * query_heads * head_dim;
-    size_t kv_elems = (size_t)batch_size * src_seq_len * kv_heads * head_dim;
-    if (h_q.size() != q_elems || h_k.size() != kv_elems || h_v.size() != kv_elems) {
+    size_t num_query_elements = (size_t)batch_size * target_seq_len * query_heads * head_dim;
+    size_t num_kv_elements = (size_t)batch_size * src_seq_len * kv_heads * head_dim;
+    if (h_q.size() != num_query_elements || h_k.size() != num_kv_elements || h_v.size() != num_kv_elements) {
         throw std::runtime_error("Input tensor size mismatch");
     }
     
-    // 修正：限制 head_dim 以防止 kernel 内部的 acc 数组越界
-    // 如果需要支持更大的 head_dim (如256)，需要修改 kernel 中的 acc[128] 大小
     if (head_dim > 128) {
-        throw std::runtime_error("head_dim > 128 is not supported by this kernel implementation (acc buffer overflow risk).");
+        throw std::runtime_error("head_dim > 128 is not supported by this kernel implementation.");
     }
     if (head_dim <= 0) {
         throw std::runtime_error("head_dim must be positive.");
     }
+    
+    if (query_heads % kv_heads != 0) {
+        throw std::runtime_error("query_heads must be divisible by kv_heads for GQA.");
+    }
 
-    h_o.resize(q_elems);
+    h_o.resize(num_query_elements);
 
     // 2. 设备内存分配
-    T *d_q, *d_k, *d_v, *d_o;
-    size_t q_bytes  = q_elems * sizeof(T);
-    size_t kv_bytes = kv_elems * sizeof(T);
+    T *device_q, *device_k, *device_v, *device_o;
+    size_t query_bytes  = num_query_elements * sizeof(T);
+    size_t kv_bytes = num_kv_elements * sizeof(T);
 
-    cudaMalloc(&d_q, q_bytes);
-    cudaMalloc(&d_k, kv_bytes);
-    cudaMalloc(&d_v, kv_bytes);
-    cudaMalloc(&d_o, q_bytes);
+    cudaMalloc(&device_q, query_bytes);
+    cudaMalloc(&device_k, kv_bytes);
+    cudaMalloc(&device_v, kv_bytes);
+    cudaMalloc(&device_o, query_bytes);
 
-    cudaMemcpy(d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), kv_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), kv_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_q, h_q.data(), query_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_k, h_k.data(), kv_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_v, h_v.data(), kv_bytes, cudaMemcpyHostToDevice);
 
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     cudaStream_t stream = 0;
-    cudaError_t err;
+    cudaError_t cuda_error;
 
     // 3. Launch 配置
-    // RTX 3050 具有 48KB default shared memory.
-    // 使用 auto lambda 简化启动逻辑
-    auto launch = [&](auto kernel, int Br, int Bc) {
-        int num_q_tiles = (target_seq_len + Br - 1) / Br;
-        if (num_q_tiles == 0) num_q_tiles = 1;
+    // Lambda 用于处理不同 BLOCK_SIZE_Q/BLOCK_SIZE_KV 的启动
+    auto launch_kernel = [&](auto kernel, int block_size_q, int block_size_kv) {
+        int num_query_blocks = (target_seq_len + block_size_q - 1) / block_size_q;
+        if (num_query_blocks == 0) num_query_blocks = 1;
 
-        dim3 grid(query_heads, batch_size, num_q_tiles);
-        dim3 block(Br);
+        dim3 grid(query_heads, batch_size, num_query_blocks);
+        dim3 block(block_size_q);
 
         if (grid.x > 65535 || grid.y > 65535 || grid.z > 65535) {
             throw std::runtime_error("Grid dimension exceeds CUDA limit");
         }
 
-        // 计算共享内存大小 (float 类型)
-        size_t smem_size = (Br + Bc + Bc) * head_dim * sizeof(float);
+        size_t dynamic_shared_mem_size = (block_size_q + block_size_kv + block_size_kv) * head_dim * sizeof(float);
         
-        // RTX 3050 (Ampere) 支持动态共享内存扩展
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, 0);
+        // 设置 Shared Memory 限制
+        cudaError_t attribute_error = cudaFuncSetAttribute(
+            kernel, 
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 
+            (int)dynamic_shared_mem_size
+        );
         
-        // 如果需要的 smem 超过默认值，尝试申请更多
-        if (smem_size > prop.sharedMemPerBlock) {
-             // 这里只是尝试设置，如果失败会由 kernel launch 返回错误
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
-        }
-
-        kernel<<<grid, block, smem_size, stream>>>(
-            d_q, d_k, d_v, d_o,
+        kernel<<<grid, block, dynamic_shared_mem_size, stream>>>(
+            device_q, device_k, device_v, device_o,
             batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads, head_dim,
             is_causal, softmax_scale
@@ -346,29 +361,27 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     };
 
     // 根据维度选择 Tile 大小
-    // head_dim=64 -> Br=64, smem=(64+64+64)*64*4 = 48KB (刚好卡在 3050 默认限制)
-    // head_dim=128 -> Br=32, smem=(32+32+32)*128*4 = 48KB
+    // 使用修改后的 Kernel 函数指针
     if (head_dim <= 64) {
-        launch(flash_attention_kernel<T, 64, 64>, 64, 64);
+        launch_kernel(flash_attention_kernel_original_softmax<T, 64, 64>, 64, 64);
     } else if (head_dim <= 128) {
-        launch(flash_attention_kernel<T, 32, 32>, 32, 32);
+        launch_kernel(flash_attention_kernel_original_softmax<T, 32, 32>, 32, 32);
     } else {
-        // 理论上通过修改 acc 大小可以支持更大维度，但此处为了安全已在开头拦截
-        launch(flash_attention_kernel<T, 16, 16>, 16, 16);
+        launch_kernel(flash_attention_kernel_original_softmax<T, 16, 16>, 16, 16);
     }
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
-        throw std::runtime_error(std::string("Kernel launch failed: ") + cudaGetErrorString(err));
+    cuda_error = cudaGetLastError();
+    if (cuda_error != cudaSuccess) {
+        cudaFree(device_q); cudaFree(device_k); cudaFree(device_v); cudaFree(device_o);
+        throw std::runtime_error(std::string("Kernel launch failed: ") + cudaGetErrorString(cuda_error));
     }
 
-    cudaMemcpy(h_o.data(), d_o, q_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_o.data(), device_o, query_bytes, cudaMemcpyDeviceToHost);
 
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
+    cudaFree(device_q);
+    cudaFree(device_k);
+    cudaFree(device_v);
+    cudaFree(device_o);
 }
 
 // *********************************************************************
